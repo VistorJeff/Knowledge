@@ -42,6 +42,80 @@ public:
 	typedef VectorIterator<ChildNodeMap> ChildNodeIterator;
 	// 访问子节点的 const 迭代器
 	typedef ConstVectorIterator<ChildNodeMap> ConstChildNodeIterator;
+
+	// Listener 获取节点事件的回调
+	class _OgreExport Listener
+    {
+    public:
+        Listener() {}
+        virtual ~Listener() {}
+        virtual void nodeUpdated(const Node*) {}
+        virtual void nodeDestroyed(const Node*) {}
+        virtual void nodeAttached(const Node*) {}
+        virtual void nodeDetached(const Node*) {}
+    };
+
+protected:
+	// 指向父节点的指针
+	Node* mParent;
+	// 指向多个子节点的指针数组
+	ChildNodeMap mChildren;
+
+	typedef std::set<Node*> ChildUpdateSet;
+	// 需要更新的子节点列表，当自己没过时但是子节点过时时使用
+	ChildUpdateSet mChildrenToUpdate;
+	// 节点的名字
+	String mName;
+
+	// Flag to indicate own transform from parent is out of date
+    mutable bool mNeedParentUpdate : 1;
+    // Flag indicating that all children need to be updated
+    bool mNeedChildUpdate : 1;
+    // Flag indicating that parent has been notified about update request
+    bool mParentNotified : 1;
+    // Flag indicating that the node has been queued for update
+    bool mQueuedForUpdate : 1;
+    // Stores whether this node inherits orientation from it's parent
+    bool mInheritOrientation : 1;
+    // Stores whether this node inherits scale from it's parent
+    bool mInheritScale : 1;
+    mutable bool mCachedTransformOutOfDate : 1;
+
+	// 相对于父节点的方向
+    Quaternion mOrientation;
+    // 相对于父节点的位置
+    Vector3 mPosition;
+    // 该节点的缩放比例
+    Vector3 mScale;
+
+	// 缓存派生转换的 4x4 矩阵
+	mutable Affine3 mCachedTransform;
+
+	// 仅内部可用
+	virtual void setParent(Node* parent);
+
+	// 结合局部变换和父节点变换的方向
+	// 当 SceneManager 或父节点调用 _updateFromParent 的时候更新
+	mutable Quaternion mDerivedOrientation;
+	// 同上，结合局部变换和父节点变换的位置
+	mutable Vector3 mDerivedPosition;
+	// 同上，结合局部变换和父节点变换的缩放比例
+	mutable Vector3 mDerivedScale;
+
+	// 用于关键帧动画基础的位置
+	Vector3 mInitialPosition;
+	// 用于关键帧动画基础的方向
+	Quaternion mInitialOrientation;
+	// 用于关键帧动画基础的缩放比例
+	Vector3 mInitialScale;
+
+	Listener* mListener;
+
+	// 绑定用户对象
+	UserObjectBindings mUserObjectBindings;
+
+	typedef std::vector<Node*> QueuedUpdates;
+	static QueuedUpdates msQueuedUpdates;
 ```
 
 ### Node 类的成员函数
@@ -56,6 +130,10 @@ public:
 	Node(const String& name);
 	// 析构函数是虚函数
 	virtual ~Node();
+	// 返回节点的名字
+	const String& getName(void) const { return mName; }
+	// 获取该节点的父节点
+	Node* getParent(void) const { return mParent; }
 ```
 
 #### 与位置和变换有关的函数
@@ -146,6 +224,50 @@ public:
 	// 获取这个节点的整个变换矩阵
 	// 应该只被 SceneManager 调用，确保在调用前派生的变换已经更新
 	const Affine3& _getFullTransform(void) const;
+
+	// 将此节点的当前变换设置为“初始状态”，即该位置/方向/比例将用作关键帧动画中使用的增量值的基础
+	// 除非计划为该节点设置动画，否则无需调用此方法
+	// 如果您打算对其进行动画处理，请在将节点的基本状态（即所有关键帧所基于的状态）加载到节点后，调用此方法
+	void setInitialState(void);
+	void resetToInitialState(void);
+
+	// 获取节点的初始位置
+	const Vector3& getInitialPosition(void) const { return mInitialPosition; }
+	// 获取节点的初始方向
+	const Quaternion& getInitialOrientation(void) const { return mInitialOrientation; }
+	// 获取节点的初始缩放比例
+	const Vector3& getInitialScale(void) const { return mInitialScale; }
+	// 辅助函数，获取平方的视图深度
+	Real getSquaredViewDepth(const Camera* cam) const;
+
+	// 获取给定世界空间位置相对于此节点的局部位置
+	Vector3 convertWorldToLocalPosition(const Vector3 &worldPos);
+	// 获取节点局部空间中某个点的世界位置，这对于不需要子节点的简单变换很有用
+	Vector3 convertLocalToWorldPosition(const Vector3 &localPos);
+	// 获取给定世界空间方向相对于此节点的局部方向
+	Vector3 convertWorldToLocalDirection(const Vector3 &worldDir, bool useScale);
+	Quaternion convertWorldToLocalOrientation(const Quaternion &worldOrientation);
+	// 获取节点局部空间中某个点的世界方向，这对于不需要子节点的简单变换很有用
+	Vector3 convertLocalToWorldDirection(const Vector3 &localDir, bool useScale);
+	Quaternion convertLocalToWorldOrientation(const Quaternion &localOrientation);
+
+	// 在需要对该节点进行重新计算的变换更改时被调用，告诉父节点该节点已被修改，下次更新它
+	virtual void needUpdate(bool forceParentUpdate = false);
+	// 由子节点调用，通知其父节点他们需要更新
+	void requestUpdate(Node* child, bool forceParentUpdate = false);
+	// 由子节点调用，通知其父节点他们不再需要更新
+	void cancelUpdate(Node* child);
+	// 把节点更新命令存到队列中
+	// 在场景图更新的过程中不能调用 needUpdate()
+	static void queueNeedUpdate(Node* n);
+	// 处理队列中的调用
+	static void processQueuedUpdates(void);
+
+protected:
+	// 触发节点以更新其组合变换
+	void _updateFromParent(void) const;
+	// 具体类对于 _updateFromParent 的实现
+	virtual void updateFromParentImpl(void) const;
 ```
 
 #### 与子节点有关的函数
@@ -176,5 +298,9 @@ public:
 	virtual Node* removeChild(Node* child);
 	virtual Node* removeChild(const String& name);
 	virtual void removeAllChildren(void);
+
+protected:
+	virtual Node* createChildImpl(void) = 0;
+	virtual Node* createChildImpl(const String& name) = 0;
 ```
 
